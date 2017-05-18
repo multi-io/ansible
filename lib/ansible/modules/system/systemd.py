@@ -48,7 +48,7 @@ options:
         choices: [ "yes", "no" ]
         default: null
         description:
-            - Whether the service should start on boot. B(At least one of state and enabled are required.)
+            - Whether the unit should be enabled. B(At least one of state and enabled are required.)
     masked:
         required: false
         choices: [ "yes", "no" ]
@@ -77,6 +77,23 @@ options:
             - Do not synchronously wait for the requested operation to finish.
               Enqueued job will continue without Ansible blocking on its completion.
         version_added: "2.3"
+    detect_early_failure:
+        required: false
+        default: no
+        choices: [ "yes", "no" ]
+        description:
+            - After the state change succeeded, wait a short while longer to see whether the unit enters the failed state.
+              This is mainly meant for service units that don't report startup success synchronously sd_notify ,
+              Requires state to be set and no_block to be set to "no".
+              The timeout for the wait can be set via early_failure_timeout.
+        version_added: "2.4"
+    early_failure_timeout:
+        required: false
+        default: 1.0
+        description:
+            - Timeout in seconds for detect_early_failure.
+              Requires state to be set and no_block to be set to "no".
+        version_added: "2.4"
 notes:
     - Since 2.4, one of the following options is required 'state', 'enabled', 'masked', 'daemon_reload', and all except 'daemon_reload' also require 'name'.
     - Before 2.4 you always required 'name'.
@@ -248,6 +265,8 @@ status:
         }
 '''  # NOQA
 
+import time
+
 from ansible.module_utils.basic import AnsibleModule
 from ansible.module_utils.service import sysv_exists, sysv_is_enabled, fail_if_missing
 from ansible.module_utils._text import to_native
@@ -293,6 +312,37 @@ def parse_systemctl_show(lines):
                 k = None
     return parsed
 
+def get_unit_properties(unit, systemctl, module):
+    is_initd = sysv_exists(unit)
+    is_systemd = False
+    properties = None
+
+    # check service data, cannot error out on rc as it changes across versions, assume not found
+    (rc, out, err) = module.run_command("%s show '%s'" % (systemctl, unit))
+
+    if request_was_ignored(out) or request_was_ignored(err):
+        # fallback list-unit-files as show does not work on some systems (chroot)
+        # not used as primary as it skips some services (like those using init.d) and requires .service/etc notation
+        (rc, out, err) = module.run_command("%s list-unit-files '%s'" % (systemctl, unit))
+        if rc == 0:
+            is_systemd = True
+
+    elif rc == 0:
+        # load return of systemctl show into dictionary for easy access and return
+        if out:
+            properties = parse_systemctl_show(to_native(out).split('\n'))
+
+            is_systemd = 'LoadState' in properties and properties['LoadState'] != 'not-found'
+
+            # Check for loading error
+            if is_systemd and 'LoadError' in properties:
+                module.fail_json(msg="Error loading unit file '%s': %s" % (unit, properties['LoadError']))
+    else:
+        # Check for systemctl command
+        module.run_command(systemctl, check_rc=True)
+
+    return is_systemd, is_initd, properties
+
 
 # ===========================================
 # Main control flow
@@ -308,6 +358,8 @@ def main():
             daemon_reload = dict(type='bool', default=False, aliases=['daemon-reload']),
             user = dict(type='bool', default=False),
             no_block = dict(type='bool', default=False),
+            detect_early_failure = dict(type='bool', default=False),
+            early_failure_timeout = dict(type='float', default=1),
         ),
         supports_check_mode=True,
         required_one_of=[['state', 'enabled', 'masked', 'daemon_reload']],
@@ -338,38 +390,16 @@ def main():
             module.fail_json(msg='failure %d during daemon-reload: %s' % (rc, err))
 
     if unit:
-        found = False
-        is_initd = sysv_exists(unit)
-        is_systemd = False
 
-        # check service data, cannot error out on rc as it changes across versions, assume not found
-        (rc, out, err) = module.run_command("%s show '%s'" % (systemctl, unit))
-
-        if request_was_ignored(out) or request_was_ignored(err):
-            # fallback list-unit-files as show does not work on some systems (chroot)
-            # not used as primary as it skips some services (like those using init.d) and requires .service/etc notation
-            (rc, out, err) = module.run_command("%s list-unit-files '%s'" % (systemctl, unit))
-            if rc == 0:
-                is_systemd = True
-
-        elif rc == 0:
-            # load return of systemctl show into dictionary for easy access and return
-            if out:
-                result['status'] = parse_systemctl_show(to_native(out).split('\n'))
-
-                is_systemd = 'LoadState' in result['status'] and result['status']['LoadState'] != 'not-found'
-
-                # Check for loading error
-                if is_systemd and 'LoadError' in result['status']:
-                    module.fail_json(msg="Error loading unit file '%s': %s" % (unit, result['status']['LoadError']))
-        else:
-            # Check for systemctl command
-            module.run_command(systemctl, check_rc=True)
+        is_systemd, is_initd, properties = get_unit_properties(unit, systemctl, module)
 
         # Does service exist?
         found = is_systemd or is_initd
         if is_initd and not is_systemd:
             module.warn('The service (%s) is actually an init script but the system is managed by systemd' % unit)
+
+        if is_systemd and properties:
+            result['status'] = properties
 
         # mask/unmask the service, if requested, can operate on services before they are installed
         if module.params['masked'] is not None:
@@ -457,6 +487,21 @@ def main():
                         (rc, out, err) = module.run_command("%s %s '%s'" % (systemctl, action, unit))
                         if rc != 0:
                             module.fail_json(msg="Unable to %s service %s: %s" % (action, unit, err))
+
+                        if module.params['detect_early_failure']:
+
+                            time.sleep(module.params['early_failure_timeout'])
+
+                            is_systemd, is_initd, properties = get_unit_properties(unit, systemctl, module)
+                            if not (is_systemd and properties):
+                                # this should not happen?
+                                module.fail_json(msg="Systemd service no longer found after early_failure_timeout",
+                                                 is_initd=is_initd, is_systemd=is_systemd, status=properties, previous_status=result['status'])
+
+                            result['status'] = properties
+                            if 'ActiveState' in result['status'] and result['status']['ActiveState'] == 'failed':
+                                module.fail_json(msg="Failed to %s service %s: Service went into failed state early" % (action, unit))
+
             else:
                 # this should not happen?
                 module.fail_json(msg="Service is in unknown state", status=result['status'])
