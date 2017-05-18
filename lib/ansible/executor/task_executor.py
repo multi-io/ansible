@@ -253,13 +253,9 @@ class TaskExecutor:
         task_vars = self._job_vars
 
         loop_var = 'item'
-        label = None
-        loop_pause = 0
         if self._task.loop_control:
             # the value may be 'None', so we still need to default it back to 'item'
             loop_var = self._task.loop_control.loop_var or 'item'
-            label = self._task.loop_control.label or ('{{' + loop_var + '}}')
-            loop_pause = self._task.loop_control.pause or 0
 
         if loop_var in task_vars:
             display.warning(u"The loop variable '%s' is already in use. "
@@ -270,6 +266,16 @@ class TaskExecutor:
         items = self._squash_items(items, loop_var, task_vars)
         for item in items:
             task_vars[loop_var] = item
+            
+            if self._task.loop_control:
+                templar = Templar(loader=self._loader, shared_loader_obj=self._shared_loader_obj, variables=task_vars)
+                loop_control = self._task.loop_control.copy()
+                loop_control.post_validate(templar)
+                label = loop_control.label or ('{{' + loop_var + '}}')
+                loop_pause = loop_control.pause or 0
+            else:
+                label = '{{' + loop_var + '}}'
+                loop_pause = 0
 
             # pause between loop iterations
             if loop_pause and ran_once:
