@@ -82,8 +82,9 @@ options:
         default: no
         choices: [ "yes", "no" ]
         description:
-            - After the state change succeeded, wait a short while longer to see whether the unit enters the failed state.
-              This is mainly meant for service units that don't report startup success synchronously sd_notify ,
+            - For service units, after the state change succeeded, wait a short while longer to see whether the
+              service enters the failed state. This is mainly meant for simple service units that don't report
+              startup success synchronously (via sd_notify).
               Requires state to be set and no_block to be set to "no".
               The timeout for the wait can be set via early_failure_timeout.
         version_added: "2.4"
@@ -265,6 +266,7 @@ status:
         }
 '''  # NOQA
 
+import re
 import time
 
 from ansible.module_utils.basic import AnsibleModule
@@ -369,6 +371,8 @@ def main():
     if module.params['user']:
         systemctl = systemctl + " --user"
     if module.params['no_block']:
+        if module.params['detect_early_failure']:
+            module.fail_json(msg="no_block and detect_early_failure don't go together")
         systemctl = systemctl + " --no-block"
     unit = module.params['name']
     rc = 0
@@ -488,7 +492,9 @@ def main():
                         if rc != 0:
                             module.fail_json(msg="Unable to %s service %s: %s" % (action, unit, err))
 
-                        if module.params['detect_early_failure']:
+                        unit_type = re.compile("[^.]*$").search(result['status']['Id']).group(0).lower()
+
+                        if unit_type == 'service' and action in ('start', 'stop', 'restart') and module.params['detect_early_failure']:
 
                             time.sleep(module.params['early_failure_timeout'])
 
