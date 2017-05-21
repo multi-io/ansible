@@ -52,6 +52,10 @@ RUN apt-get update -y && \
     && \
     apt-get clean
 
+# undo some leet hax of the base image
+RUN rm /usr/sbin/policy-rc.d; \
+	rm /sbin/initctl; dpkg-divert --rename --remove /sbin/initctl
+
 RUN rm /etc/apt/apt.conf.d/docker-clean
 RUN mkdir /etc/ansible/
 RUN /bin/echo -e "[local]\nlocalhost ansible_connection=local" > /etc/ansible/hosts
