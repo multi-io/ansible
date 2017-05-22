@@ -4,6 +4,7 @@ RUN apt-get update -y && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     acl \
     apache2 \
+    apt-utils \
     asciidoc \
     bzip2 \
     cdbs \
