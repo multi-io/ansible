@@ -258,6 +258,13 @@ status:
 
 import re
 import time
+import os
+
+# python 2/3 compat
+try:
+    OSFileNotFoundError = FileNotFoundError
+except NameError:
+    OSFileNotFoundError = OSError
 
 from ansible.module_utils.basic import AnsibleModule
 from ansible.module_utils.service import sysv_exists, sysv_is_enabled, fail_if_missing
@@ -335,6 +342,13 @@ def get_unit_properties(unit, systemctl, module):
 
     return is_systemd, is_initd, properties
 
+def is_running_in_chroot():
+    try:
+        s1 = os.stat('/')
+        s2 = os.stat('/proc/1/root')
+        return s1.st_dev != s2.st_dev or s1.st_ino != s2.st_ino
+    except OSFileNotFoundError:
+        return True
 
 # ===========================================
 # Main control flow
@@ -499,8 +513,11 @@ def main():
                                 module.fail_json(msg="Failed to %s service %s: Service went into failed state early" % (action, unit))
 
             else:
-                # this can happen when we're running in a chroot, in which case systemd supports only enable/disable operations
-                module.warn('Service is in unknown state')
+                # ActiveState couldn't be determined. Expected when running in a chroot, in which case systemctl supports only enable/disable operations
+                if is_running_in_chroot():
+                    module.warn("Running in chroot. Ignoring service state being unknown")
+                else:
+                    module.fail_json(msg="Service is in unknown state", status=result['status'])
 
 
     module.exit_json(**result)
